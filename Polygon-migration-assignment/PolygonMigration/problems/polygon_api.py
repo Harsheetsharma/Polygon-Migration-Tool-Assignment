@@ -15,6 +15,7 @@ import logging
 import shutil
 import subprocess
 import stat
+from problems.storage.gdrive import GoogleDriveStorage
 
 logger = logging.getLogger(__name__)
 
@@ -582,7 +583,8 @@ class PolygonAPI:
             db_problem_id (str, optional): The database problem ID for naming. Defaults to None.
         """
         sys.path.append('.')
-        from problems.AzureTestcase import AzureBlobManager
+        # from problems.AzureTestcase import AzureBlobManager
+        from problems.storage.gdrive import GoogleDriveStorage
         
         logger.info("Processing custom checker for problem %s", problem_id)
         
@@ -605,14 +607,15 @@ class PolygonAPI:
         # Use CUSTOM_CHECKER_DIR from environment if available
         checker_dir = settings.CUSTOM_CHECKER_DIR
         logger.info("Initializing Azure Blob Manager for custom checker upload")
-        blob_manager = AzureBlobManager(
-            account_url=azure_account_url,
-            tenant_id=azure_tenant_id,
-            client_id=azure_client_id,
-            username=azure_username,
-            password=azure_password
-        )
-        
+        # blob_manager = AzureBlobManager(
+        #     account_url=azure_account_url,
+        #     tenant_id=azure_tenant_id,
+        #     client_id=azure_client_id,
+        #     username=azure_username,
+        #     password=azure_password
+        # )
+        storage = GoogleDriveStorage()
+
         if checker_dir:
             if not os.path.exists(checker_dir):
                 os.makedirs(checker_dir, exist_ok=True)
@@ -731,7 +734,46 @@ class PolygonAPI:
                     logger.error(f"Container: {container_name}, Blob: {blob_name}")
                     logger.error(f"Binary size: {len(binary_data)} bytes")
 
-    def migrate_to_azure_blob(self, problem_id, azure_account_url, azure_tenant_id, azure_client_id, azure_username, azure_password, container_name, db_problem_id=None, testset='tests'):
+    def upload_custom_checker_to_gdrive(self, problem_id, db_problem_id=None):
+        """
+        Handles uploading the custom checker (if any) to Google Drive.
+        If the checker needs compilation, it uploads the compiled binary.
+        Otherwise, uploads the source code.
+        """
+        checker_info = self.get_custom_checker_info(problem_id)
+        if not checker_info:
+            logger.info("No custom checker found for problem %s", problem_id)
+            return
+
+        source_code = self.fetch_custom_checker_file(problem_id, checker_info['name'])
+        if not source_code:
+            logger.warning("Custom checker file not found for problem %s", problem_id)
+            return
+
+        storage = GoogleDriveStorage()
+    
+        # Temp directory for files
+        temp_dir = "/tmp/custom_checker"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Compile if necessary (this is pseudo-code, depends on your compile_custom_checker)
+        binary_path = self.compile_custom_checker(source_code, temp_dir)
+    
+        if binary_path:
+            local_path = binary_path
+            blob_filename = 'custom_checker.exe' if sys.platform.startswith('win') else 'custom_checker'
+        else:
+            # fallback: upload source code
+            local_path = os.path.join(temp_dir, "custom_checker.cpp")
+            with open(local_path, 'w', encoding='utf-8') as f:
+                f.write(source_code)
+
+            remote_path = f"test_cases/{db_problem_id or problem_id}/custom_checker"
+            storage.upload_file(local_path, remote_path)
+        logger.info("Uploaded custom checker for problem %s to Google Drive", problem_id)
+
+
+    def migrate_to_gdrive(self, problem_id, db_problem_id=None, testset='tests'):
         """
         Fetches all test cases from Redis (or Polygon as fallback) and uploads them to Azure Blob Storage using AzureBlobManager.
         Each test case's input and output are uploaded as separate blobs.
@@ -750,7 +792,8 @@ class PolygonAPI:
             testset (str, optional): The testset name. Defaults to 'tests'.
         """
         sys.path.append('.')  # Ensure root dir is in path for import
-        from problems.AzureTestcase import AzureBlobManager
+        # from problems.AzureTestcase import AzureBlobManager
+        from problems.storage.gdrive import GoogleDriveStorage
 
         logger.info("Starting migrate_to_azure_blob for problem %s", problem_id)
 
@@ -767,20 +810,22 @@ class PolygonAPI:
         
         logger.info("Retrieved %d test cases for Azure migration", len(test_cases))
 
-        blob_manager = AzureBlobManager(
-            account_url=azure_account_url,
-            tenant_id=azure_tenant_id,
-            client_id=azure_client_id,
-            username=azure_username,
-            password=azure_password
-        )
+        # blob_manager = AzureBlobManager(
+        #     account_url=azure_account_url,
+        #     tenant_id=azure_tenant_id,
+        #     client_id=azure_client_id,
+        #     username=azure_username,
+        #     password=azure_password
+        # )
+        storage = GoogleDriveStorage()
 
         problem_id_for_naming = db_problem_id if db_problem_id is not None else problem_id
         logger.info("Using problem_id_for_naming: %s", problem_id_for_naming)
         
         # Delete all test cases before updating the new ones
         logger.info("Deleting existing test cases from Azure")
-        blob_manager.empty_blob(container_name, problem_id_for_naming)
+        # blob_manager.empty_blob(container_name, problem_id_for_naming)
+        # storage.delete_folder(problem_id_for_naming)
 
         uploaded_count = 0
         for idx, test in enumerate(test_cases, start=1):
@@ -788,8 +833,30 @@ class PolygonAPI:
             output_data = test.get('output', '')
             if input_data and output_data:
                 # Use database problem ID if provided, otherwise fall back to polygon_id
-                blob_manager.upload_test_case(container_name, problem_id_for_naming, idx, input_data, output_data)
+                # blob_manager.upload_test_case(container_name, problem_id_for_naming, idx, input_data, output_data)
                 uploaded_count += 1
+
+                # Construct local temp files
+                input_local_path = os.path.join(temp_dir, f"{idx:02d}.in")
+                output_local_path = os.path.join(temp_dir, f"{idx:02d}.out")
+
+                with open(input_local_path, 'w', encoding='utf-8') as f:
+                    f.write(input_data)
+
+                with open(output_local_path, 'w', encoding='utf-8') as f:
+                    f.write(output_data)
+
+                # Construct remote paths in Google Drive
+                # remote_input_path = f"{problem_id_for_naming}/{idx:02d}.in"
+                # remote_output_path = f"{problem_id_for_naming}/{idx:02d}.out"
+                remote_input_path = f"test_cases/{problem_id_for_naming}/{idx}"
+                remote_output_path = f"test_cases/{problem_id_for_naming}/{idx}.a"
+                remote_path = f"test_cases/{problem_id_for_naming}/custom_checker"
+
+                # Upload using GoogleDriveStorage
+                storage.upload_file(input_local_path, remote_input_path)
+                storage.upload_file(output_local_path, remote_output_path)
+
             else:
                 logger.warning(f"Skipping test case #{idx}: missing input or output. input: {repr(input_data[:50] + ('...' if len(input_data) > 50 else ''))}, output: {repr(output_data[:50] + ('...' if len(output_data) > 50 else ''))}")
         
@@ -797,18 +864,19 @@ class PolygonAPI:
         
         # Handle custom checker if present
         logger.info("Starting custom checker processing for problem %s", problem_id)
-        self.upload_custom_checker_to_azure(
+        self.upload_custom_checker_to_gdrive(
             problem_id, 
-            azure_account_url, 
-            azure_tenant_id, 
-            azure_client_id, 
-            azure_username, 
-            azure_password, 
-            container_name, 
+            # azure_account_url, 
+            # azure_tenant_id, 
+            # azure_client_id, 
+            # azure_username, 
+            # azure_password, 
+            # container_name, 
             db_problem_id
         )
         logger.info("Completed custom checker processing for problem %s", problem_id)
         logger.info("Completed migrate_to_azure_blob for problem %s", problem_id)
+
 
     def delete_problem_test_case_cache(self, db_problem_id):
         """
